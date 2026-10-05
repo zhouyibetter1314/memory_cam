@@ -3,6 +3,8 @@
     cd code && python run_demo.py
 """
 
+import argparse
+import logging
 import os
 import sys
 
@@ -13,19 +15,47 @@ from osm.interaction import AnswerGenerator, QueryEngine
 from osm.memory import ObjectMemory
 from osm.perception import Detector, PoseEstimator
 from experiments.sim_dataset import generate_scene
+from osm.runtime import (FrameController, add_runtime_arguments,
+                         configure_logging, log_frame)
+
+logger = logging.getLogger(__name__)
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="单场景物体记忆演示")
+    add_runtime_arguments(parser)
+    args = parser.parse_args(argv)
+    configure_logging(args)
+    control = FrameController(args.fps, args.step)
     cfg = DEFAULT
     scene = generate_scene(0, cfg, seed=cfg.seed)
     rng = __import__("random").Random(cfg.seed)
     det, pose_est = Detector(cfg, rng), PoseEstimator(cfg, rng)
     mem = ObjectMemory(cfg)
 
-    for frame in scene["frames"]:
-        f = dict(frame)
-        f["pose"] = pose_est.estimate(frame["pose"])
-        mem.update(det.predict(f), frame["frame_id"])
+    logger.info("启动仿真演示：%s 帧", len(scene["frames"]))
+    last_frame = None
+    processed = 0
+    try:
+        for frame in scene["frames"]:
+            if not control.terminal_advance():
+                break
+            timing = control.begin_frame()
+            f = dict(frame)
+            f["pose"] = pose_est.estimate(frame["pose"])
+            obs = det.predict(f)
+            mem.update(obs, frame["frame_id"])
+            last_frame = frame
+            processed += 1
+            log_frame(logger, frame["frame_id"], frame["timestamp"], obs,
+                      control.clock() - timing[0])
+            if control.paused:
+                print(f"[帧 {frame['frame_id']}] time={frame['timestamp']:.3f}s "
+                      f"observations={len(obs)} memory={len(mem.all_nodes())}")
+            control.pace(*timing)
+    except KeyboardInterrupt:
+        logger.info("用户中断")
+    logger.info("结束，已处理 %s 帧", processed)
 
     print(f"真值物体数：{len(scene['objects'])}；记忆库节点数：{len(mem.all_nodes())}")
     print(f"自动更新 {mem.n_auto_update} 次；用户确认 {mem.n_user_confirmed} 次；"
@@ -40,7 +70,8 @@ def main():
     for q in ["我的钥匙放在哪了？", "水杯在哪里？", "上次什么时候看到背包的？",
               "最近有什么东西位置变了？"]:
         hits = qe.retrieve(q)
-        print(f"  Q: {q}\n  A: {ag.generate(q, hits, scene['frames'][-1]['frame_id'])}")
+        if last_frame is not None:
+            print(f"  Q: {q}\n  A: {ag.generate(q, hits, last_frame['frame_id'], now_timestamp=last_frame['timestamp'])}")
 
 
 if __name__ == "__main__":

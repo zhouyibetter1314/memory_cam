@@ -10,12 +10,15 @@
 对应类的 predict() 实现，接口签名保持不变（见各类注释中的 TODO）。
 """
 
+import logging
 import math
 import random
 from typing import List, Sequence, Tuple
 
 from .types import Observation
 from .utils import l2_normalize
+
+logger = logging.getLogger(__name__)
 
 
 class Detector:
@@ -197,11 +200,15 @@ class Reidentifier:
         use_geo = cfg.w_geo > 0
 
         if use_app and s_app >= cfg.app_hi:
-            return "match", max(fused, 0.95)                # 外观强证据：允许位置变化
-        if use_app and d > cfg.move_thresh and s_app >= cfg.app_lo:
-            return "pending", fused                          # 中等证据 + 位置突变 → 人工裁决
-        if use_app and s_app >= cfg.app_mid and (not use_geo or s_geo >= cfg.geo_thresh):
-            return "match", fused
-        if not use_app and use_geo and s_geo >= cfg.geo_thresh:
-            return "match", fused                            # w/o 外观：仅几何证据
-        return "reject", fused
+            verdict, score = "match", max(fused, 0.95)
+        elif use_app and d > cfg.move_thresh and s_app >= cfg.app_lo:
+            verdict, score = "pending", fused
+        elif use_app and s_app >= cfg.app_mid and (not use_geo or s_geo >= cfg.geo_thresh):
+            verdict, score = "match", fused
+        elif not use_app and use_geo and s_geo >= cfg.geo_thresh:
+            verdict, score = "match", fused
+        else:
+            verdict, score = "reject", fused
+        logger.debug("frame=%s oid=%s verdict=%s app=%.4f geo=%.4f distance=%.4f score=%.4f",
+                     obs.frame_id, node.oid, verdict, s_app, s_geo, d, score)
+        return verdict, score

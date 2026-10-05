@@ -7,6 +7,7 @@
     4) 用户反馈闭环：确认 / 纠正 / 重命名，写入记忆并影响后续匹配
 """
 
+import logging
 import math
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -15,6 +16,8 @@ from .config import Config
 from .perception import Reidentifier
 from .types import Event, ObjectNode, Observation
 from .utils import dist3, ema, hungarian
+
+logger = logging.getLogger(__name__)
 
 
 class ObjectMemory:
@@ -40,6 +43,13 @@ class ObjectMemory:
         """处理一帧的所有观测，返回本帧产生的事件。"""
         cfg = self.cfg
         frame_events: List[Event] = []
+        logger.debug("frame=%s observations=%s nodes=%s pending=%s",
+                     frame_id, len(observations), len(self.nodes), len(self.pending))
+        if logger.isEnabledFor(logging.DEBUG):
+            for oi, obs in enumerate(observations):
+                logger.debug("frame=%s obs=%s input_time=%.6f cls=%s score=%.3f bbox=%s pos=%s",
+                             frame_id, oi, obs.timestamp, obs.cls_pred, obs.cls_score,
+                             obs.bbox, obs.pos_world)
         if not observations:
             self._mark_missing(frame_id)
             return frame_events
@@ -65,6 +75,7 @@ class ObjectMemory:
                     "kind": "moved", "oid": node.oid, "frame_id": frame_id,
                     "new_pos": list(obs.pos_world), "new_feat": list(obs.feat),
                     "sim": sim, "gt_id": obs.gt_id,
+                    "timestamp": obs.timestamp,
                 }
                 frame_events.append(Event("pending_confirm", node.oid, frame_id,
                                           {"reason": "position_jump", "sim": round(sim, 3)}))
@@ -106,6 +117,7 @@ class ObjectMemory:
                 oid=self.next_oid, cls=obs.cls_pred, pos=list(obs.pos_world),
                 feat=list(obs.feat), last_seen=frame_id, first_seen=frame_id,
                 obs_count=1, conf=obs.cls_score, history=[list(obs.pos_world)],
+                last_seen_timestamp=obs.timestamp,
             )
             self.nodes[self.next_oid] = node
             self.next_oid += 1
@@ -115,6 +127,9 @@ class ObjectMemory:
 
         self._mark_missing(frame_id)
         self.events.extend(frame_events)
+        for event in frame_events:
+            logger.info("frame=%s %s oid=%s detail=%s",
+                        event.frame_id, event.kind, event.oid, event.detail)
         return frame_events
 
     # ------------------------------------------------------------------ 关联
@@ -173,6 +188,7 @@ class ObjectMemory:
         node.feat = ema(node.feat, obs.feat, 0.2)
         node.feat = [x / (math.sqrt(sum(v * v for v in node.feat)) or 1e-12) for x in node.feat]
         node.last_seen = frame_id
+        node.last_seen_timestamp = obs.timestamp
         node.obs_count += 1
         node.conf = min(1.0, node.conf + 0.05 * (1.0 - node.conf))
         node.history.append(list(node.pos))
@@ -206,8 +222,10 @@ class ObjectMemory:
             if gap > self.cfg.stale_frames:
                 node.state = "removed"
                 self.events.append(Event("disappeared", node.oid, frame_id, {"gap": gap}))
+                logger.info("frame=%s disappeared oid=%s gap=%s", frame_id, node.oid, gap)
             elif gap > self.cfg.max_gap_frames and node.state == "active":
                 node.state = "missing"
+                logger.info("frame=%s missing oid=%s gap=%s", frame_id, node.oid, gap)
 
     # ------------------------------------------------------------------ 人机协同
     def resolve_pending(self, key: int, accept: bool, correction: Optional[dict] = None):
@@ -228,6 +246,7 @@ class ObjectMemory:
             node.pos = correction.get("pos", item["new_pos"]) if correction else item["new_pos"]
             node.feat = item["new_feat"]
             node.last_seen = item["frame_id"]
+            node.last_seen_timestamp = item.get("timestamp")
             node.history.append(list(node.pos))
             if item.get("gt_id") is not None:
                 self.frame_assign.append((item["gt_id"], node.oid))
@@ -238,6 +257,7 @@ class ObjectMemory:
         else:
             node.conf = max(0.1, node.conf - 0.15)      # 拒绝 → 降低该节点可信度
             self.n_user_rejected += 1
+        logger.info("pending=%s oid=%s accepted=%s", key, node.oid, accept)
         if correction:
             if "cls" in correction:
                 node.cls = correction["cls"]
@@ -246,7 +266,8 @@ class ObjectMemory:
                 node.user_label = correction["name"]
                 node.notes.append(f"用户命名：{correction['name']}")
 
-    def user_correct_position(self, oid: int, pos: List[float], frame_id: int = -1):
+    def user_correct_position(self, oid: int, pos: List[float], frame_id: int = -1,
+                              timestamp: Optional[float] = None):
         """用户主动纠正：直接改写物体位置（例如"我把杯子挪到书桌上了"）。"""
         node = self.nodes.get(oid)
         if node is None:
@@ -254,10 +275,13 @@ class ObjectMemory:
         node.pos = list(pos)
         node.history.append(list(node.pos))
         node.move_streak = 0
+        if frame_id >= node.last_seen:
+            node.last_seen_timestamp = timestamp
         node.last_seen = max(node.last_seen, frame_id)
         node.conf = min(1.0, node.conf + 0.10)
         node.notes.append(f"用户纠正位置 @frame {frame_id}")
         self.n_user_initiated += 1
+        logger.info("frame=%s user_correct oid=%s pos=%s", frame_id, oid, pos)
         return True
 
     def rename(self, oid: int, name: str):
@@ -265,6 +289,7 @@ class ObjectMemory:
         if node:
             node.user_label = name
             node.notes.append(f"用户命名：{name}")
+            logger.info("rename oid=%s name=%s", oid, name)
 
     # ------------------------------------------------------------------ 查询接口
     def all_nodes(self) -> List[ObjectNode]:

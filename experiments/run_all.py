@@ -9,7 +9,9 @@
     results/ablation.md       消融实验表
 """
 
+import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -20,6 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from osm.config import DEFAULT                     # noqa: E402
 from osm.pipeline import run_sequence              # noqa: E402
 from experiments.sim_dataset import generate_dataset  # noqa: E402
+from osm.runtime import add_log_arguments, configure_logging
+
+logger = logging.getLogger(__name__)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -54,14 +59,18 @@ def fmt(v, nd=3, pct=False):
     return f"{v * 100:.1f}" if pct else f"{v:.{nd}f}"
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="批量复现仿真实验（不限速）")
+    add_log_arguments(parser)
+    args = parser.parse_args(argv)
+    configure_logging(args)
     t0 = time.time()
     os.makedirs(RESULTS, exist_ok=True)
     cfg = DEFAULT
     scenes = generate_dataset(cfg, seed=cfg.seed)
 
     # ---------------------------------------------------------------- 主实验
-    print(f"[1/3] 系统性能实验：{len(scenes)} 个场景序列 …")
+    logger.info("[1/3] 系统性能实验：%s 个场景序列", len(scenes))
     main_runs = [run_sequence(s, cfg, seed=cfg.seed + s["scene_id"], user="oracle")
                  for s in scenes]
     main_agg = aggregate(main_runs)
@@ -75,24 +84,24 @@ def main():
         "w/o 回环校正（位姿漂移）": (dict(pose_drift_std=0.0035), "oracle"),
     }
     # 中期基线：仅几何关联（无外观重识别）+ 无用户协同 = 中期阶段原型
-    print("[1.5/3] 中期基线（Baseline）…")
+    logger.info("[1.5/3] 中期基线（Baseline）")
     base_cfg = cfg.override(w_app=0.0, auto_update_margin=1.0)
     base_runs = [run_sequence(s, base_cfg, seed=cfg.seed + s["scene_id"], user="none")
                  for s in scenes]
     base_agg = aggregate(base_runs)
 
-    print("[2/3] 消融实验 …")
+    logger.info("[2/3] 消融实验")
     abl_results = {}
     for name, (over, user) in ablations.items():
         c = cfg.override(**over)
         runs = [run_sequence(s, c, seed=cfg.seed + s["scene_id"], user=user) for s in scenes]
         abl_results[name] = aggregate(runs)
-        print(f"      {name}: reid={abl_results[name]['reid_acc']:.3f} "
-              f"loc={abl_results[name]['loc_error_median']:.3f}m "
-              f"F1={abl_results[name]['change_f1']:.3f}")
+        logger.info("%s: reid=%.3f loc=%.3fm F1=%.3f", name,
+                    abl_results[name]['reid_acc'], abl_results[name]['loc_error_median'],
+                    abl_results[name]['change_f1'])
 
     # ---------------------------------------------------------------- 用户实验
-    print("[3/3] 用户交互实验（交互代价与主观负荷）…")
+    logger.info("[3/3] 用户交互实验（交互代价与主观负荷）")
     user_variants = {
         "常规场景 + 有人参与（本文方法）": (dict(), "oracle"),
         "常规场景 + 无用户参与": (dict(auto_update_margin=1.0), "none"),
@@ -223,7 +232,7 @@ def main():
         f.write("# 消融实验\n\n" + "\n".join(t2))
 
     print("\n" + md)
-    print(f"\n结果已写入 {RESULTS}（用时 {time.time() - t0:.1f}s）")
+    logger.info("结果已写入 %s（用时 %.1fs）", RESULTS, time.time() - t0)
 
 
 if __name__ == "__main__":

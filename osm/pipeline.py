@@ -7,7 +7,9 @@
 对应报告 3.1 节的总体框架。
 """
 
+import logging
 import random
+import time
 from collections import defaultdict
 from typing import Dict, List, Optional
 
@@ -18,6 +20,9 @@ from .perception import Detector, PoseEstimator
 from .metrics import (change_detection_f1, idf1, localization_errors,
                       memory_consistency, nasa_tlx, reid_accuracy)
 from .utils import dist3
+from .runtime import log_frame
+
+logger = logging.getLogger(__name__)
 
 
 def _iou(a, b) -> float:
@@ -67,6 +72,7 @@ def run_sequence(scene: dict, cfg: Config, seed: int = 0,
 
     frames = scene["frames"]
     for frame in frames:
+        frame_started = time.perf_counter()
         est_pose = pose_est.estimate(frame["pose"])
         f = dict(frame)
         f["pose"] = est_pose                     # 用带噪位姿做反投影
@@ -157,6 +163,8 @@ def run_sequence(scene: dict, cfg: Config, seed: int = 0,
             query_hits += 1 if ok else 0
             if frame["frame_id"] % 50 == 0:
                 answers.append(ag.generate(text, hits, frame["frame_id"]))
+        log_frame(logger, frame["frame_id"], frame["timestamp"], obs_list,
+                  time.perf_counter() - frame_started)
 
     # ---------------- 指标汇总 ----------------
     loc_errs = localization_errors(mem, gt_positions)

@@ -104,7 +104,7 @@ class AnswerGenerator:
         self.frame_interval_s = frame_interval_s
 
     def generate(self, text: str, hits: List[Tuple[ObjectNode, float]],
-                 now_frame: int, memory=None) -> str:
+                 now_frame: int, memory=None, now_timestamp: Optional[float] = None) -> str:
         intent, _ = QueryEngine.parse(text)
         if not hits:
             return "记忆中没有找到相关物品，是否需要我再扫一遍房间？"
@@ -120,6 +120,8 @@ class AnswerGenerator:
         if intent == "when":
             n = hits[0][0]
             delta_s = (now_frame - n.last_seen) * self.frame_interval_s
+            if now_timestamp is not None and n.last_seen_timestamp is not None:
+                delta_s = max(0.0, now_timestamp - n.last_seen_timestamp)
             if delta_s < 60:
                 t = f"{delta_s:.0f} 秒前"
             else:

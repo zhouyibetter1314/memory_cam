@@ -37,6 +37,7 @@ class ObjectNode:
     move_streak: int = 0                   # 连续检测到位移的帧数（变化确认用）
     user_label: Optional[str] = None       # 用户自定义名称（人机协同标注）
     notes: List[str] = field(default_factory=list)
+    last_seen_timestamp: Optional[float] = None  # 输入源时间；与运行速度无关
 
 
 @dataclass
