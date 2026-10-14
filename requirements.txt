@@ -1,6 +1,3 @@
-# 核心包 osm 与实验脚本（run_demo.py / experiments/run_all.py）
-# 仅依赖 Python ≥ 3.9 标准库，无需安装任何第三方包。
-#
-# 以下依赖仅供 demo/webcam_demo.py 摄像头模式使用：
 opencv-python>=4.8
 numpy>=1.24
+ultralytics>=8.4.0,<9

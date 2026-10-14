@@ -6,8 +6,8 @@
     3) 视觉定位（位姿）     PoseEstimator
     4) 外观编码/重识别      AppearanceEncoder
 
-默认使用"仿真后端"（SimBackend），保证无 GPU 环境可复现；真实模型只需替换
-对应类的 predict() 实现，接口签名保持不变（见各类注释中的 TODO）。
+Detector 用于仿真复现；ImagePerception 统一封装真实图像的 YOLO / motion 检测。
+两者均输出 Observation，供同一条记忆管线消费。
 """
 
 import logging
@@ -15,6 +15,7 @@ import math
 import random
 from typing import List, Sequence, Tuple
 
+from .labels import canonical_class
 from .types import Observation
 from .utils import l2_normalize
 
@@ -25,8 +26,7 @@ class Detector:
     """物体检测与分类。
 
     仿真后端：对视场内可见物体按 det_score 采样，输出带噪声的 bbox 与类别。
-    真实后端：TODO 替换为 YOLOv8 / Grounding-DINO，接口 predict(image) -> List[dict]
-             每个 dict 至少包含 bbox / cls / score。
+    真实图像后端见 ImagePerception.predict(image, frame_id=..., timestamp=...)。
     """
 
     def __init__(self, cfg, rng: random.Random):
@@ -78,6 +78,171 @@ class Detector:
                     gt_cls=obj["cls"],
                 )
             )
+        return obs_list
+
+
+class YoloError(RuntimeError):
+    """YOLO 配置、加载或推理错误。"""
+
+
+class ImagePerception:
+    """真实图像感知：YOLO / motion → HSV 特征、近似平面位置和 Observation。
+
+    不读取摄像头或视频，也不创建窗口；输入为 OpenCV BGR 图像。
+    YOLO 检测静止物体；motion 保留背景预热与 45 帧静止吸收。
+    第三方依赖只在实例化真实图像后端时导入。
+    """
+
+    def __init__(self, cfg, *, detector="yolo", yolo_model="yolo26n.pt",
+                 yolo_conf=0.35, yolo_imgsz=640, yolo_device=None, yolo_classes=None):
+        if detector not in ("yolo", "motion"):
+            raise ValueError(f"未知检测器：{detector}")
+        try:
+            import cv2
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError("图像感知需要 pip install -r requirements.txt") from exc
+        self.cv2, self.np = cv2, np
+        self.cfg = cfg
+        self.detector = detector
+        self.model = None
+        self.predict_options = dict(conf=yolo_conf, imgsz=yolo_imgsz,
+                                    classes=yolo_classes, verbose=False, save=False)
+        if yolo_device is not None:
+            self.predict_options["device"] = yolo_device
+        self.pixels_per_meter = 260.0  # 固定视角下的粗略比例，可由调用方调节。
+        self.bg = None
+        self.bg_alpha = 0.02
+        self.min_area = 1800
+        self.still_absorb = 45
+        self._still = {}
+        if detector == "yolo":
+            self._load_yolo(yolo_model)
+
+    def predict(self, image, *, frame_id: int, timestamp: float) -> List[Observation]:
+        """处理单帧，保留调用方提供的帧编号与源时间戳。"""
+        observations = (self._detect_yolo(image) if self.detector == "yolo"
+                        else self._detect_motion(image))
+        for obs in observations:
+            obs.frame_id, obs.timestamp = frame_id, timestamp
+        return observations
+
+    def _load_yolo(self, weights):
+        try:
+            from ultralytics import YOLO
+            conf, imgsz = self.predict_options["conf"], self.predict_options["imgsz"]
+            if not math.isfinite(conf) or not 0 <= conf <= 1:
+                raise ValueError("YOLO 置信度必须为 [0,1] 内的有限数值")
+            if not isinstance(imgsz, int) or imgsz <= 0:
+                raise ValueError("YOLO 图像尺寸必须为正整数")
+            self.model = YOLO(weights)
+            if self.model.task != "detect":
+                raise ValueError("请使用目标检测权重（例如 yolo26n.pt）")
+            classes = self.predict_options["classes"]
+            names = self.model.names
+            valid_ids = set(names) if isinstance(names, dict) else set(range(len(names)))
+            if classes is not None and any(c not in valid_ids for c in classes):
+                raise ValueError(f"类别编号必须属于模型类别：{sorted(valid_ids)}")
+        except Exception as exc:
+            raise YoloError(
+                f"YOLO 初始化失败：{exc}。请安装 pip install -r requirements.txt，"
+                "检查权重与参数；或使用 --detector motion") from exc
+        logger.info("YOLO 检测器：model=%s options=%s", weights, self.predict_options)
+
+    # ------------------------------------------------------------------
+    def _signature(self, bbox) -> int:
+        x1, y1, x2, y2 = bbox
+        return (int((x1 + x2) / 40) * 1000 + int((y1 + y2) / 40))
+
+    def _hist(self, hsv, mask, bbox) -> list:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        roi_h = hsv[y1:y2, x1:x2]
+        roi_m = mask[y1:y2, x1:x2] if mask is not None else None
+        hist = self.cv2.calcHist([roi_h], [0, 1, 2], roi_m,
+                                [12, 4, 2], [0, 180, 0, 256, 0, 256])
+        hist = hist.flatten().astype(float)
+        s = hist.sum()
+        if s > 0:
+            hist /= s
+        return hist.tolist()
+
+    def _observation(self, hsv, bbox, cls_pred, score, mask=None):
+        h, w = hsv.shape[:2]
+        x1, y1, x2, y2 = bbox
+        cx_m = ((x1 + x2) / 2 - w / 2) / self.pixels_per_meter
+        cy_m = ((y1 + y2) / 2 - h / 2) / self.pixels_per_meter
+        height_m = (y2 - y1) / self.pixels_per_meter
+        return Observation(
+            frame_id=-1, timestamp=0.0, cls_pred=cls_pred, cls_score=score,
+            bbox=(x1 / w, y1 / h, x2 / w, y2 / h),
+            depth=1.0, cam_pose=(0.0, 0.0, 0.0),
+            feat=self._hist(hsv, mask, bbox),
+            pos_world=[round(cx_m, 3), round(height_m, 3), round(cy_m, 3)],
+        )
+
+    def _detect_yolo(self, frame):
+        try:
+            results = self.model.predict(source=frame, **self.predict_options)
+            if not results or results[0].boxes is None:
+                return []
+            result = results[0]
+            boxes = result.boxes.cpu()
+            hsv = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2HSV)
+            h, w = frame.shape[:2]
+            observations = []
+            for coords, score, cls_id in zip(boxes.xyxy.tolist(), boxes.conf.tolist(),
+                                            boxes.cls.tolist()):
+                if (not all(math.isfinite(v) for v in (*coords, score, cls_id))
+                        or not 0 <= score <= 1 or score < self.predict_options["conf"]):
+                    continue
+                cls_id = int(cls_id)
+                classes = self.predict_options["classes"]
+                if classes is not None and cls_id not in classes:
+                    continue
+                x1, y1, x2, y2 = coords
+                x1, x2 = max(0.0, min(w, x1)), max(0.0, min(w, x2))
+                y1, y2 = max(0.0, min(h, y1)), max(0.0, min(h, y2))
+                if x2 <= x1 or y2 <= y1 or int(x2) <= int(x1) or int(y2) <= int(y1):
+                    continue
+                name = canonical_class(result.names[cls_id])
+                observations.append(self._observation(hsv, (x1, y1, x2, y2), name, score))
+            return observations
+        except Exception as exc:
+            raise YoloError(
+                f"YOLO 推理失败：{exc}。请检查权重与 --yolo-device；"
+                "或使用 --detector motion") from exc
+
+    def _detect_motion(self, frame):
+        gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY).astype("float32")
+        if self.bg is None:
+            self.bg = gray
+            return []
+        diff = self.cv2.absdiff(gray, self.bg)
+        _, mask = self.cv2.threshold(diff, 28, 255, self.cv2.THRESH_BINARY)
+        mask = mask.astype("uint8")
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_OPEN, self.np.ones((5, 5), self.np.uint8))
+        mask = self.cv2.dilate(mask, self.np.ones((9, 9), self.np.uint8), iterations=2)
+
+        contours, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL,
+                                           self.cv2.CHAIN_APPROX_SIMPLE)
+        hsv = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2HSV)
+        obs_list, new_still = [], {}
+        for c in contours:
+            area = self.cv2.contourArea(c)
+            if area < self.min_area:
+                continue
+            x, y, bw, bh = self.cv2.boundingRect(c)
+            sig = self._signature((x, y, x + bw, y + bh))
+            still = self._still.get(sig, 0) + 1
+            new_still[sig] = still
+            if still > self.still_absorb:
+                continue                   # 静止物体已并入背景，不再重复上报
+            obs_list.append(self._observation(
+                hsv, (x, y, x + bw, y + bh), "未知物体",
+                min(1.0, area / 12000.0), mask))
+        self._still = new_still
+        # 背景缓慢更新（被前景区域遮盖的部分由静止吸收机制处理）
+        self.cv2.accumulateWeighted(gray, self.bg, self.bg_alpha)
         return obs_list
 
 

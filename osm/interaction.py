@@ -13,6 +13,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from .types import ObjectNode
+from .labels import COCO_NAMES
 
 
 # 中文常用物体名称 → 规范类别的同义词表（真实系统可由 LLM 做同义归一）
@@ -36,6 +37,9 @@ SYNONYMS: Dict[str, str] = {
     "台灯": "台灯", "灯": "台灯",
     "拖鞋": "拖鞋", "鞋": "拖鞋",
 }
+for _english, _chinese in COCO_NAMES.items():
+    SYNONYMS.setdefault(_english, _chinese)
+    SYNONYMS.setdefault(_chinese, _chinese)
 
 INTENT_PATTERNS = [
     ("change", re.compile(r"(变化|变了|移动|动过|不一样|新增|不见)")),
@@ -61,8 +65,13 @@ class QueryEngine:
                 intent = name
                 break
         target = None
-        for word, canon in SYNONYMS.items():
-            if word in text:
+        folded = text.casefold()
+        # 长名称优先，避免「手提包」命中「包」、hot dog 命中 dog。
+        for word in sorted(SYNONYMS, key=len, reverse=True):
+            canon = SYNONYMS[word]
+            found = (re.search(r"(?<![a-z0-9_])" + re.escape(word) + r"(?![a-z0-9_])", folded)
+                     if word.isascii() else word in text)
+            if found:
                 target = canon
                 break
         return intent, target

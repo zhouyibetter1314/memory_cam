@@ -14,7 +14,7 @@
 ## 第一阶段：真实视觉与身份保持
 
 - [x] 支持摄像头与视频文件输入，统一帧、时间戳及 `Observation` 输出。
-- [ ] 接入 YOLO，输出类别、检测框和置信度，统一中英文类别名称。
+- [x] 在 `osm/perception.py` 的 `ImagePerception.predict` 中封装 YOLO26n，默认用于摄像头与视频；通过 `--detector motion` 保留旧检测模式，统一输出 `Observation` 与 COCO 中英文类别名称。
 - [ ] 接入短期跟踪；区分跟踪编号 `track_id` 与持久记忆编号 `oid`。
 - [ ] 接入 DINOv2 / CLIP 外观特征，支持遮挡、出画后的实例重识别。
 - [ ] 使用固定摄像头，以图像坐标或桌面区域表示位置，调整关联阈值。
